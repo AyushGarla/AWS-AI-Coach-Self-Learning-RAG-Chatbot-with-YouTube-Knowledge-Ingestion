@@ -1,131 +1,228 @@
 # --------------------------------------------------------------
-# vector_store.py (FINAL, clean, stable)
+# vector_store.py (FINAL — supports AWS KB + Transcript vectorstores)
 # --------------------------------------------------------------
-# Handles ONLY transcript vectorstores.
-# Safe, overwrite-only, no versioning needed.
+# Handles:
+#   1. Building AWS KB vectorstore from metadata-rich chunks
+#   2. Building Transcript vectorstore from chunks.txt
+#   3. Loading vectorstores safely for RAG agent
 #
-# Author: Ayush Garla
+# Compatible with:
+# - kb_chunker.py
+# - RAG_Agent.py
+# - aws_info.py
 # --------------------------------------------------------------
 
 import os
+import glob
 import shutil
-import textwrap
+from datetime import datetime
 
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_chroma import Chroma
 from langchain_core.documents import Document
-from langchain_community.vectorstores import Chroma
-from langchain_community.embeddings import HuggingFaceEmbeddings
 
-
+# Embedding model
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
+# Directory paths
+TRANSCRIPT_CHUNKS_FILE = "chunks.txt"
+TRANSCRIPT_STORE_DIR = "vectorstore"
+AWS_STORE_BASE = "aws/vectorstore_versions"
 
-# --------------------------------------------------------------
-# Parse chunks from chunks.txt
-# --------------------------------------------------------------
-def load_chunks(chunks_path="chunks.txt"):
-    if not os.path.exists(chunks_path):
-        raise FileNotFoundError(f"{chunks_path} missing. Run NLP pipeline first.")
 
-    chunks, current = [], []
+# =====================================================================
+# 1. LOAD TRANSCRIPT CHUNKS
+# =====================================================================
 
-    with open(chunks_path, "r", encoding="utf-8") as f:
+def load_transcript_chunks(path=TRANSCRIPT_CHUNKS_FILE):
+    """Reads chunks.txt → returns list of text chunks."""
+    if not os.path.exists(path):
+        print(f"❌ Missing {path}. Run NLP.py first.")
+        return []
+
+    chunks = []
+    current_chunk = []
+
+    with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
 
-            if line.startswith("### CHUNK "):
-                if current:
-                    chunks.append(" ".join(current))
-                    current = []
-                continue
+            # new chunk starts
+            if line.startswith("### CHUNK"):
+                if current_chunk:
+                    chunks.append("\n".join(current_chunk))
+                current_chunk = []
+            else:
+                if line:
+                    current_chunk.append(line)
 
-            if line:
-                current.append(line)
+        # last chunk
+        if current_chunk:
+            chunks.append("\n".join(current_chunk))
 
-    if current:
-        chunks.append(" ".join(current))
-
+    print(f"📄 Loaded {len(chunks)} transcript chunks.")
     return chunks
 
 
-# --------------------------------------------------------------
-# Build Transcript Vector Store (safe overwrite)
-# --------------------------------------------------------------
-def build_vector_store(chunks_path="chunks.txt", vector_dir="vectorstore"):
-    """
-    1. Removes OLD transcript vectorstore safely.
-    2. Loads chunks from NLP pipeline.
-    3. Builds NEW transcript vectorstore.
-    """
+# =====================================================================
+# 2. BUILD TRANSCRIPT VECTORSTORE
+# =====================================================================
 
-    print(f"\n📦 Building new transcript vectorstore at '{vector_dir}'...")
+def build_transcript_vectorstore():
+    """Rebuild transcript vectorstore."""
+    print("🛠 Rebuilding transcript vectorstore...")
 
-    # -- remove old store safely --
-    if os.path.exists(vector_dir):
-        try:
-            shutil.rmtree(vector_dir)
-            print("🗑 Old transcript vectorstore removed.")
-        except Exception as e:
-            print(f"⚠️ Could not remove old vectorstore: {e}")
+    if os.path.exists(TRANSCRIPT_STORE_DIR):
+        shutil.rmtree(TRANSCRIPT_STORE_DIR)
 
-    # -- load chunks --
-    chunks = load_chunks(chunks_path)
-    print(f"✅ Loaded {len(chunks)} chunks.")
+    chunks = load_transcript_chunks()
+    if not chunks:
+        return None
 
-    print("\n🔎 Preview (first 200 chars):")
-    print(textwrap.fill(chunks[0][:200], width=100))
-
-    # -- embeddings --
-    print("\n🔡 Loading embedding model:", EMBED_MODEL)
     embeddings = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
 
-    # -- convert chunks to documents --
-    docs = [
-        Document(page_content=c, metadata={"chunk_id": i + 1})
-        for i, c in enumerate(chunks)
-    ]
-
-    # -- build vectorstore --
-    os.makedirs(vector_dir, exist_ok=True)
-    db = Chroma.from_documents(
-        documents=docs,
-        embedding=embeddings,
-        persist_directory=vector_dir
+    db = Chroma(
+        collection_name="transcript_store",
+        persist_directory=TRANSCRIPT_STORE_DIR,
+        embedding_function=embeddings
     )
 
-    print(f"\n📁 Transcript vectorstore created at: {vector_dir}")
+    docs = [
+        Document(
+            page_content=c,
+            metadata={"source": "transcript"}
+        ) for c in chunks
+    ]
 
-    # Optional test
-    example_q = "What is AWS Lambda?"
-    results = db.similarity_search(example_q, k=1)
-    print("\n🔍 Retrieval Test:")
-    for r in results:
-        print(f"- Chunk {r.metadata['chunk_id']}: {r.page_content[:150]}...")
+    db.add_documents(docs)
 
+    print("✅ Transcript vectorstore built.")
     return db
 
 
-# --------------------------------------------------------------
-# Load existing transcript vectorstore
-# --------------------------------------------------------------
-def load_vector_store(vector_dir="vectorstore"):
-    if not os.path.exists(vector_dir):
-        raise FileNotFoundError(f"Transcript vectorstore '{vector_dir}' does not exist. Build it first.")
+def load_transcript_vectorstore():
+    """Load or rebuild transcript vectorstore."""
+    if not os.path.exists(TRANSCRIPT_STORE_DIR):
+        print("⚠️ Transcript store missing, rebuilding...")
+        return build_transcript_vectorstore()
 
     embeddings = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
 
-    print(f"⬆️ Loading transcript vectorstore from: {vector_dir}")
+    db = Chroma(
+        collection_name="transcript_store",
+        persist_directory=TRANSCRIPT_STORE_DIR,
+        embedding_function=embeddings
+    )
+
+    print("📄 Transcript retriever loaded.")
+    return db
+
+
+# =====================================================================
+# 3. BUILD AWS KNOWLEDGE BASE VECTORSTORE
+# =====================================================================
+
+def build_aws_kb_vectorstore(kb_chunks):
+    """
+    kb_chunks = list of dicts:
+        {
+            "service": "...",
+            "chunk_id": "...",
+            "text": "..."
+        }
+    """
+
+    timestamp = str(int(datetime.now().timestamp()))
+    store_dir = os.path.join(AWS_STORE_BASE, f"store_{timestamp}")
+
+    os.makedirs(store_dir, exist_ok=True)
+    print(f"🛠 Creating AWS KB vectorstore at: {store_dir}")
+
+    embeddings = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
 
     db = Chroma(
-        persist_directory=vector_dir,
+        collection_name="aws_kb",
+        persist_directory=store_dir,
+        embedding_function=embeddings
+    )
+
+    docs = []
+    for item in kb_chunks:
+        docs.append(
+            Document(
+                page_content=item["text"],
+                metadata={
+                    "service": item["service"],
+                    "chunk_id": item["chunk_id"]
+                }
+            )
+        )
+
+    db.add_documents(docs)
+
+    # Meta file for debugging
+    with open(os.path.join(store_dir, "meta.json"), "w", encoding="utf-8") as f:
+        f.write(f'{{"timestamp": "{timestamp}"}}')
+
+    print("✅ AWS KB vectorstore built.")
+    return store_dir
+
+
+# =====================================================================
+# 4. LOAD LATEST AWS KB VECTORSTORE
+# =====================================================================
+
+def load_latest_aws_kb_vectorstore():
+    """Load most recent AWS KB vectorstore version."""
+
+    if not os.path.exists(AWS_STORE_BASE):
+        print("⚠️ No AWS KB store found.")
+        return None
+
+    versions = sorted(glob.glob(os.path.join(AWS_STORE_BASE, "store_*")))
+    if not versions:
+        print("⚠️ No KB versions found.")
+        return None
+
+    latest = versions[-1]
+    print(f"🔁 Loading AWS KB VectorStore from: {latest}")
+
+    embeddings = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
+
+    db = Chroma(
+        collection_name="aws_kb",
+        persist_directory=latest,
         embedding_function=embeddings
     )
 
     return db
 
 
-# --------------------------------------------------------------
-# Script entry point
-# --------------------------------------------------------------
+# =====================================================================
+# 5. RESET ALL STORES
+# =====================================================================
+
+def reset_all_vectorstores():
+    print("🗑 Resetting all vectorstores...")
+
+    if os.path.exists(TRANSCRIPT_STORE_DIR):
+        shutil.rmtree(TRANSCRIPT_STORE_DIR)
+
+    if os.path.exists(AWS_STORE_BASE):
+        shutil.rmtree(AWS_STORE_BASE)
+
+    print("✅ All vectorstores cleared.")
+
+
+# =====================================================================
+# DEBUG MODE
+# =====================================================================
+
 if __name__ == "__main__":
-    print("🏗 Building transcript vectorstore...\n")
-    build_vector_store()
+    print("Debug loading stores...")
+
+    t = load_transcript_vectorstore()
+    print("Transcript store:", t)
+
+    a = load_latest_aws_kb_vectorstore()
+    print("AWS KB store:", a)
